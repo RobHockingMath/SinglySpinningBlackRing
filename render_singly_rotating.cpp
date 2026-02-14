@@ -7,6 +7,8 @@
 #include <thread>
 #include <iomanip>
 #include <limits>
+#include <cstdlib>
+#include <string>
 
 #ifdef SRB_USE_OPENMP
   #include <omp.h>
@@ -48,137 +50,74 @@ static inline double clamp01(double x) { return std::min(1.0, std::max(0.0, x));
 static inline double clamp(double x, double a, double b) { return std::min(b, std::max(a, x)); }
 
 // ------------------------------
-// Stable helpers for new chart:
-//   x = tanh(chi)
-//   y = -cosh(eta)
-//   D = x - y = tanh(chi) + cosh(eta) = (1+tanh) + (cosh-1)
+// Stable helpers for (x,y) chart
 // ------------------------------
-static inline double tanh_plus_one_stable(double chi) {
-  if (chi >= 0.0) {
-    const double e = std::exp(-2.0*chi);
-    return 2.0 / (1.0 + e);
-  } else {
-    const double e = std::exp( 2.0*chi);
-    return 2.0 * e / (1.0 + e);
-  }
+static inline long double D_stable_xy(double x, double y) {
+  return (1.0L + (long double)x) + (-1.0L - (long double)y);
 }
-
-static inline double one_minus_tanh_stable(double chi) {
-  if (chi >= 0.0) {
-    const double e = std::exp(-2.0*chi);
-    return 2.0 * e / (1.0 + e);
-  } else {
-    const double e = std::exp( 2.0*chi);
-    return 2.0 / (1.0 + e);
-  }
+static inline long double omx2_stable_xy(double x) {
+  const long double xl = (long double)x;
+  return (1.0L - xl) * (1.0L + xl);
 }
-
-static inline double sech2_stable(double chi) {
-  const double a = std::abs(chi);
-  const double t = std::exp(-2.0*a);
-  const double d = 1.0 + t;
-  return 4.0 * t / (d*d);
+static inline long double y2m1_stable_xy(double y) {
+  const long double yl = (long double)y;
+  return (yl - 1.0L) * (yl + 1.0L);
 }
-
-static inline long double coshm1_stable(double eta) {
-  const long double h = 0.5L*(long double)eta;
-  const long double sh = std::sinh(h);
-  return 2.0L*sh*sh;
-}
-
-static inline long double D_stable(double chi, double eta) {
-  return (long double)tanh_plus_one_stable(chi) + coshm1_stable(eta);
-}
-
-static inline long double rho2_stable(const singly_rotating_black_ring::Params& P,
-                                      double chi, double eta)
+static inline long double rho2_stable_xy(const singly_rotating_black_ring::Params& P,
+                                        double x, double y)
 {
-  const long double num = coshm1_stable(eta) + (long double)one_minus_tanh_stable(chi);
-  const long double den = D_stable(chi, eta);
-  if (!(den > 0.0L)) return std::numeric_limits<long double>::quiet_NaN();
-  return (long double)(P.R*P.R) * num / den;
+  const long double D = D_stable_xy(x, y);
+  if (!(D > 0.0L)) return std::numeric_limits<long double>::quiet_NaN();
+  const long double num = -(long double)y - (long double)x;
+  return (long double)(P.R*P.R) * num / D;
 }
 
-// Convert (chi,eta,phi,psi) -> hyperplane R^3 coords (x1,x2,vCoord) using stable D.
-//   r1 = R*sech(chi)/D
-//   r2 = R*sinh(eta)/D
-static inline bool ring_to_cart3_hyperplane_chieta(
+// Outgoing direction in hyperplane R^3 = (x1, x2, vCoord) from (x,y,phi,psi) and derivatives.
+static inline bool outgoing_dir_cart3_from_xy_derivs(
     const singly_rotating_black_ring::Params& P,
-    double chi, double eta, double phi, double psi,
-    double v3, double v4,
-    double& X1, double& X2, double& Vc)
-{
-  if (!std::isfinite(chi) || !std::isfinite(eta) || eta < 0.0) return false;
-
-  const long double D = D_stable(chi, eta);
-  if (!(D > 0.0L)) return false;
-
-  const long double invD = 1.0L / D;
-  const long double R_over_D = (long double)P.R * invD;
-
-  const long double sech = std::sqrt((long double)sech2_stable(chi));
-  const long double sH   = std::sinh((long double)eta);
-
-  const long double r1 = R_over_D * sech;
-  const long double r2 = R_over_D * sH;
-
-  // wrap only for trig evaluation (doesn't mutate state)
-  const double psi_w = core::wrap_pi(psi);
-  const double phi_w = core::wrap_pi(phi);
-
-  const double x1 = (double)r2 * std::cos(psi_w);
-  const double x2 = (double)r2 * std::sin(psi_w);
-
-  const double x3 = (double)r1 * std::cos(phi_w);
-  const double x4 = (double)r1 * std::sin(phi_w);
-
-  X1 = x1;
-  X2 = x2;
-  Vc = x3*v3 + x4*v4;
-  return std::isfinite(X1) && std::isfinite(X2) && std::isfinite(Vc);
-}
-
-// Outgoing direction in hyperplane R^3 = (x1, x2, vCoord) from (chi,eta,phi,psi) and derivatives.
-static inline bool outgoing_dir_cart3_from_chieta_derivs(
-    const singly_rotating_black_ring::Params& P,
-    double chi, double eta, double phi, double psi,
-    double dchi, double deta, double dphi, double dpsi,
+    double x, double y, double phi, double psi,
+    double dx, double dy, double dphi, double dpsi,
     double v3, double v4,
     double& dX1, double& dX2, double& dV)
 {
-  if (!std::isfinite(chi) || !std::isfinite(eta) || eta < 0.0) return false;
+  if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(phi) || !std::isfinite(psi)) return false;
+  if (!std::isfinite(dx) || !std::isfinite(dy) || !std::isfinite(dphi) || !std::isfinite(dpsi)) return false;
+  if (!(x > -1.0 && x < 1.0)) return false;
+  if (!(y <= -1.0)) return false;
 
-  const long double D = D_stable(chi, eta);
+  const long double D = D_stable_xy(x, y);
   if (!(D > 0.0L)) return false;
+
+  long double omx2 = omx2_stable_xy(x);
+  long double y2m1 = y2m1_stable_xy(y);
+  if (omx2 < 0.0L) omx2 = 0.0L;
+  if (y2m1 < 0.0L) y2m1 = 0.0L;
 
   const long double invD = 1.0L / D;
   const long double R_over_D = (long double)P.R * invD;
 
-  const double x     = std::tanh(chi);
-  const double sech2 = sech2_stable(chi);
-  const long double sech = std::sqrt((long double)sech2);
+  const long double s1 = std::sqrt(omx2);
+  const long double s2 = std::sqrt(y2m1);
 
-  const long double sH = std::sinh((long double)eta);
-  const long double cH = 1.0L + coshm1_stable(eta);
+  const double r1 = (double)(R_over_D * s1);
+  const double r2 = (double)(R_over_D * s2);
 
-  const double r1 = (double)(R_over_D * sech);
-  const double r2 = (double)(R_over_D * sH);
-
-  // dD = sech^2 * dchi + sinh * deta
-  const long double dD = (long double)sech2 * (long double)dchi + sH * (long double)deta;
+  // dD = dx - dy
+  const long double dD = (long double)dx - (long double)dy;
   const long double dD_over_D = dD * invD;
 
-  // d(sech)/dchi = -sech*tanh
-  const long double dsech = -(sech * (long double)x) * (long double)dchi;
+  // ds1 = d sqrt(1-x^2) = (-x/s1) dx
+  // ds2 = d sqrt(y^2-1) = (y/s2) dy
+  constexpr long double S_EPS = 1e-300L;
+  const long double invs1 = 1.0L / std::max(s1, S_EPS);
+  const long double invs2 = 1.0L / std::max(s2, S_EPS);
 
-  // dr1 = (R/D)*dsech - r1*(dD/D)
-  const double dr1 = (double)(R_over_D * dsech - (long double)r1 * dD_over_D);
+  const long double ds1 = (-(long double)x) * (long double)dx * invs1;
+  const long double ds2 = ( (long double)y) * (long double)dy * invs2;
 
-  // d(sinh)/deta = cosh
-  const long double dsinh = cH * (long double)deta;
-
-  // dr2 = (R/D)*dsinh - r2*(dD/D)
-  const double dr2 = (double)(R_over_D * dsinh - (long double)r2 * dD_over_D);
+  // dr = (R/D)*ds - r*(dD/D)
+  const double dr1 = (double)(R_over_D * ds1 - (long double)r1 * dD_over_D);
+  const double dr2 = (double)(R_over_D * ds2 - (long double)r2 * dD_over_D);
 
   const double psi_w = core::wrap_pi(psi);
   const double phi_w = core::wrap_pi(phi);
@@ -196,46 +135,6 @@ static inline bool outgoing_dir_cart3_from_chieta_derivs(
   dV = dr1*a + r1*da_dphi*dphi;
 
   return std::isfinite(dX1) && std::isfinite(dX2) && std::isfinite(dV);
-}
-
-static void debug_one_ray(
-    const singly_rotating_black_ring::Params& P,
-    const singly_rotating_black_ring::RenderOpts& R,
-    const core::RKOpts& O,
-    const singly_rotating_black_ring::Frame5& F,
-    double v3, double v4,
-    const core::Vec4& ncam,
-    double sMax)
-{
-  using namespace singly_rotating_black_ring;
-
-  Y7 y0{};
-  RayConsts C{};
-  if (!init_null_ray_from_frame(F, ncam, y0, C)) {
-    std::cout << "debug_one_ray: init failed\n";
-    return;
-  }
-
-  // IMPORTANT: debug uses the SAME integration path as render now.
-  auto res = trace_ray(P, R, O, y0, C, sMax);
-
-  const double chi_f = res.y_end[1];
-  const double eta_f = res.y_end[2];
-  const double x_f   = std::tanh(chi_f);
-  const double y_f   = -std::cosh(eta_f);
-
-  const long double Df = D_stable(chi_f, eta_f);
-  const long double rho2f = rho2_stable(P, chi_f, eta_f);
-
-  std::cout << "\n--- DEBUG ONE RAY ---\n";
-  std::cout << "event=" << res.event << "  reason=" << rk_reason_name(res.reason)
-            << "  n_accept=" << res.n_accept << "  n_reject=" << res.n_reject << "\n";
-  std::cout << "s_end=" << res.s_end << "  sMax=" << sMax << "\n";
-  std::cout << "final: chi=" << chi_f << " eta=" << eta_f
-            << "   (x=" << x_f << " y=" << y_f << ")"
-            << "  D=" << (double)Df << "  rho^2=" << (double)rho2f << "\n";
-  std::cout << "r_escape^2=" << (R.r_escape * R.r_escape) << "\n";
-  std::cout << "---------------------\n";
 }
 
 // Bilinear sampler for equirect RGB panorama.
@@ -296,6 +195,44 @@ static inline void sample_fallback_sky(double dx, double dy, double dz, unsigned
   outRGB[2] = (unsigned char)std::lround(255.0 * clamp01(b));
 }
 
+static void debug_one_ray_dump(
+    const singly_rotating_black_ring::Params& P,
+    const singly_rotating_black_ring::RenderOpts& R,
+    const core::RKOpts& O,
+    const singly_rotating_black_ring::Frame5& F,
+    const core::Vec4& ncam,
+    double sMax,
+    const char* csv_path)
+{
+  using namespace singly_rotating_black_ring;
+
+  Y7 y0{};
+  RayConsts C{};
+  if (!init_null_ray_from_frame(F, ncam, y0, C)) {
+    std::cout << "debug_one_ray: init failed\n";
+    return;
+  }
+
+  auto res = trace_ray_dump_csv(P, R, O, y0, C, sMax, csv_path);
+  std::cout << "Wrote trajectory CSV: " << csv_path << "\n";
+
+  const double x_f = res.y_end[1];
+  const double y_f = res.y_end[2];
+
+  const long double Df = D_stable_xy(x_f, y_f);
+  const long double rho2f = rho2_stable_xy(P, x_f, y_f);
+
+  std::cout << "\n--- DEBUG ONE RAY ---\n";
+  std::cout << "rescale_pow=" << R.rescale_pow << "\n";
+  std::cout << "event=" << res.event << "  reason=" << rk_reason_name(res.reason)
+            << "  n_accept=" << res.n_accept << "  n_reject=" << res.n_reject << "\n";
+  std::cout << "s_end=" << res.s_end << "  sMax=" << sMax << "\n";
+  std::cout << "final: x=" << x_f << " y=" << y_f
+            << "  D=" << (double)Df << "  rho^2=" << (double)rho2f << "\n";
+  std::cout << "r_escape^2=" << (R.r_escape * R.r_escape) << "\n";
+  std::cout << "---------------------\n";
+}
+
 int main(int argc, char** argv) {
   std::ios::sync_with_stdio(false);
   std::cout.tie(nullptr);
@@ -305,6 +242,10 @@ int main(int argc, char** argv) {
 
   // ---- Load panorama ----
   const char* panoPath = (argc > 1) ? argv[1] : "panorama.jpg";
+
+  int rescale_pow = 0;
+  if (argc > 2) rescale_pow = std::clamp(std::atoi(argv[2]), 0, 2);
+
   int panoW=0, panoH=0, panoC=0;
   unsigned char* panoData = stbi_load(panoPath, &panoW, &panoH, &panoC, 3);
 
@@ -326,8 +267,8 @@ int main(int argc, char** argv) {
   P.lambda = 2*P.nu/(1 + P.nu*P.nu);
 
   // ---- Camera ----
-  Vec4 v{}; v[0]=0; v[1]=0; v[2]=1; v[3]=0;   // v-axis in x3x4 plane
-  Vec3 pos{}; pos[0]=1; pos[1]=1; pos[2]=60;  // your test position
+  Vec4 v{}; v[0]=0; v[1]=0; v[2]=1; v[3]=0;
+  Vec3 pos{}; pos[0]=1; pos[1]=1; pos[2]=60;
   Vec3 up{};  up[0]=0; up[1]=0; up[2]=1;
 
   Frame5 F = build_camera_frame(P, pos, up, v);
@@ -343,15 +284,16 @@ int main(int argc, char** argv) {
 
   double cam_r = std::sqrt(F.p4[0]*F.p4[0] + F.p4[1]*F.p4[1] + F.p4[2]*F.p4[2] + F.p4[3]*F.p4[3]);
   R.r_escape = 5.0 * cam_r;
+  R.rescale_pow = rescale_pow;
 
   core::RKOpts O;
   O.rtol = 1e-6;
   O.atol = 1e-6;
   O.h0   = 0.5;
-  O.hmin = 1e-12;              // critical: do NOT use 1e-6 here
+  O.hmin = 1e-12;
   O.hmax = 20.0;
   O.max_steps = 400000;
-  O.force_accept_hmin = true;  // critical: don't paint the world purple at hmin
+  O.force_accept_hmin = true;
 
   // ---- Render ----
   const int W = 320;
@@ -361,16 +303,35 @@ int main(int argc, char** argv) {
   const double tan_h = std::tan(0.5*deg2rad(FOV_h));
   const double tan_v = std::tan(0.5*deg2rad(FOV_v));
 
+  int dbg_i = W/2;
+  int dbg_j = H/2;
+  if (argc > 3) dbg_i = std::atoi(argv[3]);
+  if (argc > 4) dbg_j = std::atoi(argv[4]);
+  dbg_i = std::clamp(dbg_i, 0, W-1);
+  dbg_j = std::clamp(dbg_j, 0, H-1);
+
   const double sMax = 500.0 * R.r_escape;
 
   std::vector<unsigned char> rgb(W*H*3, 255);
 
-  // Center pixel ray: forward=1
-  core::Vec4 ncam{};
-  ncam[0]=0.0; ncam[1]=0.0; ncam[2]=1.0; ncam[3]=0.0;
+  // ---- DEBUG RAY (selectable) ----
+  {
+    double sy = 1.0 - 2.0*((dbg_j + 0.5)/double(H));
+    double vScreen = tan_v * sy;
 
-  double sMax_debug = 1e6;
-  debug_one_ray(P, R, O, F, v3, v4, ncam, sMax_debug);
+    double sx = 2.0*((dbg_i + 0.5)/double(W)) - 1.0;
+    double uScreen = tan_h * sx;
+
+    Vec4 ncam{};
+    ncam[0]=uScreen; ncam[1]=vScreen; ncam[2]=1.0; ncam[3]=0.0;
+
+    std::string csv = "debug_ray_p" + std::to_string(R.rescale_pow)
+                    + "_i" + std::to_string(dbg_i)
+                    + "_j" + std::to_string(dbg_j) + ".csv";
+
+    double sMax_debug = 1e6;
+    debug_one_ray_dump(P, R, O, F, ncam, sMax_debug, csv.c_str());
+  }
 
 #ifdef SRB_USE_OPENMP
   const int nWorkers = omp_get_max_threads();
@@ -382,7 +343,7 @@ int main(int argc, char** argv) {
   std::cout << "Rendering " << W << "x" << H << " (" << N << " rays) using "
             << nWorkers << " worker(s)\n";
 
-  // ---- Fast progress: background thread + amortized atomics ----
+  // ---- Fast progress ----
   std::atomic<int> done{0};
   std::atomic<bool> stopProgress{false};
   auto t0 = std::chrono::steady_clock::now();
@@ -404,7 +365,7 @@ int main(int argc, char** argv) {
     }
   });
 
-  // ---- Stats counters (to explain purple) ----
+  // ---- Stats ----
   std::atomic<long long> cnt_horizon{0}, cnt_escape{0}, cnt_invalid{0};
   std::atomic<long long> cnt_done{0}, cnt_hmin{0}, cnt_nan{0}, cnt_maxsteps{0}, cnt_other{0};
 
@@ -445,22 +406,23 @@ int main(int argc, char** argv) {
           pixRGB[0]=pixRGB[1]=pixRGB[2]=0;
         } else if (res.event == 2) {
           le++;
+
           // ONLY sample pano for true escape
           Y7 dyds{};
           rhs(P, C, res.s_end, res.y_end, dyds);
 
-          const double chi = res.y_end[1];
-          const double eta = res.y_end[2];
+          const double x   = res.y_end[1];
+          const double y   = res.y_end[2];
           const double phi = res.y_end[3];
           const double psi = res.y_end[4];
 
-          const double dchi = dyds[1];
-          const double deta = dyds[2];
+          const double dx   = dyds[1];
+          const double dy   = dyds[2];
           const double dphi = dyds[3];
           const double dpsi = dyds[4];
 
           double dX1, dX2, dV;
-          if (outgoing_dir_cart3_from_chieta_derivs(P, chi, eta, phi, psi, dchi, deta, dphi, dpsi, v3, v4, dX1, dX2, dV)) {
+          if (outgoing_dir_cart3_from_xy_derivs(P, x, y, phi, psi, dx, dy, dphi, dpsi, v3, v4, dX1, dX2, dV)) {
             double nn = std::sqrt(dX1*dX1 + dX2*dX2 + dV*dV);
             if (nn > 0.0) {
               double ux = dX1/nn, uy = dX2/nn, uz = dV/nn;
@@ -479,7 +441,6 @@ int main(int argc, char** argv) {
           li++;
           pixRGB[0]=255; pixRGB[1]=0; pixRGB[2]=255;
         } else {
-          // event==0: classify by RKReason
           switch (res.reason) {
             case core::RKReason::Done:     ldone++; break;
             case core::RKReason::Hmin:     lhmin++; break;
@@ -527,13 +488,15 @@ int main(int argc, char** argv) {
 
   if (panoData) stbi_image_free(panoData);
 
-  if (!stbi_write_png("blackring_env.png", W, H, 3, rgb.data(), W * 3)) {
-    std::cerr << "Failed to write blackring_env.png\n";
+  char outName[128];
+  std::snprintf(outName, sizeof(outName), "blackring_env_p%d.png", rescale_pow);
+
+  if (!stbi_write_png(outName, W, H, 3, rgb.data(), W * 3)) {
+    std::cerr << "Failed to write " << outName << "\n";
     return 1;
   }
-  std::cout << "Saved blackring_env.png\n";
+  std::cout << "Saved " << outName << "\n";
 
-  // Print stats to explain purple
   std::cout << "Ray stats:\n";
   std::cout << "  horizon(event=1): " << cnt_horizon.load() << "\n";
   std::cout << "  escape (event=2): " << cnt_escape.load()  << "\n";
@@ -546,6 +509,7 @@ int main(int argc, char** argv) {
 
   return 0;
 }
+
 
 
 

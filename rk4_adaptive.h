@@ -124,18 +124,37 @@ inline double default_err_inf_raw(const std::array<double,N>& y,
   return errInf;
 }
 
-// ---------- adaptive RK4 with custom error estimator + PROJECTOR ----------
-// Signature (note proj is LAST to avoid overload collisions):
-//   rk4_adaptive(rhs, ev, err_est, s0, y0, sMax, opt, proj)
-template<size_t N, class RHS, class EventCheck, class ErrorEstimator, class Projector>
-inline RKResult<N> rk4_adaptive(RHS&& rhs,
-                               EventCheck&& ev,
-                               ErrorEstimator&& err_est,
-                               double s0,
-                               const std::array<double,N>& y0,
-                               double sMax,
-                               const RKOpts& opt,
-                               Projector&& proj)
+// ---------- observer support ----------
+enum class RKObsKind { Start, BadStep, Reject, Accept, Event, Stop };
+
+template<size_t N>
+struct RKObsInfo {
+  RKObsKind kind{};
+  int step = 0;         // attempt index
+  double s = 0.0;       // current (reject/bad) or new (accept/event) time
+  double h = 0.0;       // attempted step size
+  double errInf = 0.0;  // scaled error used for decision (already * RK_ERR_SCALE)
+  int event_id = 0;     // nonzero only for Event
+  RKReason stop_reason = RKReason::Done; // only valid for Stop
+  const std::array<double,N>* y = nullptr; // state associated with this record
+};
+
+struct IdentityObserver {
+  template<size_t N>
+  void operator()(const RKObsInfo<N>&) const noexcept {}
+};
+
+// ---------- internal adaptive impl with observer ----------
+template<size_t N, class RHS, class EventCheck, class ErrorEstimator, class Projector, class Observer>
+inline RKResult<N> rk4_adaptive_impl(RHS&& rhs,
+                                    EventCheck&& ev,
+                                    ErrorEstimator&& err_est,
+                                    double s0,
+                                    const std::array<double,N>& y0,
+                                    double sMax,
+                                    const RKOpts& opt,
+                                    Projector&& proj,
+                                    Observer&& obs)
 {
   RKResult<N> out;
   out.s_end = s0;
@@ -146,6 +165,20 @@ inline RKResult<N> rk4_adaptive(RHS&& rhs,
 
   out.y_end = y;
 
+  // observer: start
+  {
+    RKObsInfo<N> info;
+    info.kind = RKObsKind::Start;
+    info.step = 0;
+    info.s = s;
+    info.h = 0.0;
+    info.errInf = 0.0;
+    info.event_id = 0;
+    info.stop_reason = RKReason::Done;
+    info.y = &y;
+    obs(info);
+  }
+
   // Initial event check (on projected state)
   {
     int ev0 = ev(s, y);
@@ -154,6 +187,28 @@ inline RKResult<N> rk4_adaptive(RHS&& rhs,
       out.event = ev0;
       out.s_end = s;
       out.y_end = y;
+
+      RKObsInfo<N> info;
+      info.kind = RKObsKind::Event;
+      info.step = 0;
+      info.s = s;
+      info.h = 0.0;
+      info.errInf = 0.0;
+      info.event_id = ev0;
+      info.y = &y;
+      obs(info);
+
+      RKObsInfo<N> stop;
+      stop.kind = RKObsKind::Stop;
+      stop.step = 0;
+      stop.s = s;
+      stop.h = 0.0;
+      stop.errInf = 0.0;
+      stop.event_id = ev0;
+      stop.stop_reason = out.reason;
+      stop.y = &y;
+      obs(stop);
+
       return out;
     }
   }
@@ -189,10 +244,32 @@ inline RKResult<N> rk4_adaptive(RHS&& rhs,
     if (bad) {
       out.n_reject++;
 
+      RKObsInfo<N> info;
+      info.kind = RKObsKind::BadStep;
+      info.step = step;
+      info.s = s;
+      info.h = h;
+      info.errInf = std::numeric_limits<double>::infinity();
+      info.event_id = 0;
+      info.y = &y;
+      obs(info);
+
       if (h <= opt.hmin * 1.0000000001) {
         out.reason = RKReason::NaN;
         out.s_end = s;
         out.y_end = y;
+
+        RKObsInfo<N> stop;
+        stop.kind = RKObsKind::Stop;
+        stop.step = step;
+        stop.s = s;
+        stop.h = h;
+        stop.errInf = std::numeric_limits<double>::infinity();
+        stop.event_id = 0;
+        stop.stop_reason = out.reason;
+        stop.y = &y;
+        obs(stop);
+
         return out;
       }
 
@@ -209,7 +286,7 @@ inline RKResult<N> rk4_adaptive(RHS&& rhs,
       // ACCEPT: use the better approximation y_2half directly.
       std::array<double,N> y_new = y_2half;
 
-      // Re-project (caller controls any "hygiene" like angle wrapping).
+      // Re-project
       proj(y_new);
 
       double s_new = s + h;
@@ -221,6 +298,28 @@ inline RKResult<N> rk4_adaptive(RHS&& rhs,
         out.s_end = s_new;
         out.y_end = y_new;
         out.n_accept++;
+
+        RKObsInfo<N> info;
+        info.kind = RKObsKind::Event;
+        info.step = step;
+        info.s = s_new;
+        info.h = h;
+        info.errInf = errInf;
+        info.event_id = ev_id;
+        info.y = &y_new;
+        obs(info);
+
+        RKObsInfo<N> stop;
+        stop.kind = RKObsKind::Stop;
+        stop.step = step;
+        stop.s = s_new;
+        stop.h = h;
+        stop.errInf = errInf;
+        stop.event_id = ev_id;
+        stop.stop_reason = out.reason;
+        stop.y = &y_new;
+        obs(stop);
+
         return out;
       }
 
@@ -228,6 +327,16 @@ inline RKResult<N> rk4_adaptive(RHS&& rhs,
       s = s_new;
       y = y_new;
       out.n_accept++;
+
+      RKObsInfo<N> info;
+      info.kind = RKObsKind::Accept;
+      info.step = step;
+      info.s = s;
+      info.h = h;
+      info.errInf = errInf;
+      info.event_id = 0;
+      info.y = &y;
+      obs(info);
 
       // Step update (order 4 => local error ~ h^5 => exponent 1/5)
       double fac;
@@ -243,6 +352,16 @@ inline RKResult<N> rk4_adaptive(RHS&& rhs,
     } else {
       // REJECT
       out.n_reject++;
+
+      RKObsInfo<N> info;
+      info.kind = RKObsKind::Reject;
+      info.step = step;
+      info.s = s;
+      info.h = h;
+      info.errInf = errInf;
+      info.event_id = 0;
+      info.y = &y;
+      obs(info);
 
       // At (or below) hmin: either stop, or optionally force-accept if finite.
       if (h <= opt.hmin * 1.0000000001) {
@@ -260,6 +379,28 @@ inline RKResult<N> rk4_adaptive(RHS&& rhs,
             out.s_end = s_new;
             out.y_end = y_new;
             out.n_accept++;
+
+            RKObsInfo<N> evinfo;
+            evinfo.kind = RKObsKind::Event;
+            evinfo.step = step;
+            evinfo.s = s_new;
+            evinfo.h = h;
+            evinfo.errInf = errInf;
+            evinfo.event_id = ev_id;
+            evinfo.y = &y_new;
+            obs(evinfo);
+
+            RKObsInfo<N> stop;
+            stop.kind = RKObsKind::Stop;
+            stop.step = step;
+            stop.s = s_new;
+            stop.h = h;
+            stop.errInf = errInf;
+            stop.event_id = ev_id;
+            stop.stop_reason = out.reason;
+            stop.y = &y_new;
+            obs(stop);
+
             return out;
           }
 
@@ -267,7 +408,17 @@ inline RKResult<N> rk4_adaptive(RHS&& rhs,
           y = y_new;
           out.n_accept++;
 
-          h = opt.hmin; // can't go smaller; keep limping if caller asked for it
+          RKObsInfo<N> acc;
+          acc.kind = RKObsKind::Accept;
+          acc.step = step;
+          acc.s = s;
+          acc.h = h;
+          acc.errInf = errInf;
+          acc.event_id = 0;
+          acc.y = &y;
+          obs(acc);
+
+          h = opt.hmin; // keep limping
           out.s_end = s;
           out.y_end = y;
           continue;
@@ -291,7 +442,51 @@ inline RKResult<N> rk4_adaptive(RHS&& rhs,
     out.reason = RKReason::MaxSteps;
   }
 
+  // observer: stop
+  {
+    RKObsInfo<N> stop;
+    stop.kind = RKObsKind::Stop;
+    stop.step = step;
+    stop.s = s;
+    stop.h = h;
+    stop.errInf = 0.0;
+    stop.event_id = out.event;
+    stop.stop_reason = out.reason;
+    stop.y = &out.y_end;
+    obs(stop);
+  }
+
   return out;
+}
+
+// ---------- adaptive RK4 with custom error estimator + PROJECTOR ----------
+template<size_t N, class RHS, class EventCheck, class ErrorEstimator, class Projector>
+inline RKResult<N> rk4_adaptive(RHS&& rhs,
+                               EventCheck&& ev,
+                               ErrorEstimator&& err_est,
+                               double s0,
+                               const std::array<double,N>& y0,
+                               double sMax,
+                               const RKOpts& opt,
+                               Projector&& proj)
+{
+  IdentityObserver obs{};
+  return rk4_adaptive_impl<N>(rhs, ev, err_est, s0, y0, sMax, opt, proj, obs);
+}
+
+// ---------- observed version ----------
+template<size_t N, class RHS, class EventCheck, class ErrorEstimator, class Projector, class Observer>
+inline RKResult<N> rk4_adaptive_observe(RHS&& rhs,
+                                       EventCheck&& ev,
+                                       ErrorEstimator&& err_est,
+                                       double s0,
+                                       const std::array<double,N>& y0,
+                                       double sMax,
+                                       const RKOpts& opt,
+                                       Projector&& proj,
+                                       Observer&& obs)
+{
+  return rk4_adaptive_impl<N>(rhs, ev, err_est, s0, y0, sMax, opt, proj, obs);
 }
 
 // ---------- adaptive RK4 with custom error estimator (legacy, no projector) ----------
@@ -305,7 +500,8 @@ inline RKResult<N> rk4_adaptive(RHS&& rhs,
                                const RKOpts& opt)
 {
   IdentityProjector proj{};
-  return rk4_adaptive<N>(rhs, ev, err_est, s0, y0, sMax, opt, proj);
+  IdentityObserver obs{};
+  return rk4_adaptive_impl<N>(rhs, ev, err_est, s0, y0, sMax, opt, proj, obs);
 }
 
 // ---------- adaptive RK4 with default error estimator + PROJECTOR ----------
@@ -326,7 +522,8 @@ inline RKResult<N> rk4_adaptive(RHS&& rhs,
     return default_err_inf_raw<N>(y, y_full, y_2half, opt_in);
   };
 
-  return rk4_adaptive<N>(rhs, ev, err_est, s0, y0, sMax, opt, proj);
+  IdentityObserver obs{};
+  return rk4_adaptive_impl<N>(rhs, ev, err_est, s0, y0, sMax, opt, proj, obs);
 }
 
 // ---------- adaptive RK4 with default error estimator (legacy, no projector) ----------
@@ -339,10 +536,21 @@ inline RKResult<N> rk4_adaptive(RHS&& rhs,
                                const RKOpts& opt)
 {
   IdentityProjector proj{};
-  return rk4_adaptive<N>(rhs, ev, s0, y0, sMax, opt, proj);
+  auto err_est = [&](const std::array<double,N>& y,
+                     const std::array<double,N>& y_full,
+                     const std::array<double,N>& y_2half,
+                     const RKOpts& opt_in) -> double
+  {
+    return default_err_inf_raw<N>(y, y_full, y_2half, opt_in);
+  };
+
+  IdentityObserver obs{};
+  return rk4_adaptive_impl<N>(rhs, ev, err_est, s0, y0, sMax, opt, proj, obs);
 }
 
 } // namespace core
+
+
 
 
 
